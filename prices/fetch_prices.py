@@ -1,40 +1,58 @@
 #!/usr/bin/env python3
 """
-aktier — pris-hämtare.
+aktier — pris-hämtare (Avanza + Frankfurter, ingen Yahoo).
 
-Aktier + FX  -> Yahoo v8 chart-endpoint (live-kurs + dagshistorik)
-Fonder (NAV) -> Avanza publika fond-API (färskt NAV + historik via % -> absolut)
+Aktier  -> Avanza market-guide/stock/{id} (kurs) + price-chart/stock/{id} (historik)
+Fonder  -> Avanza fund-reference/reference/{id} (NAV) + fund-guide/chart (historik)
+Valuta  -> Frankfurter (ECB-dagskurser, ingen nyckel)
 Skriver till Supabase-schemat 'aktier': prices, quotes, fx_rates.
 
-Miljövariabler:
-  SUPABASE_URL                 t.ex. https://ntgqubstkkwqynikhwhc.supabase.co
-  SUPABASE_SERVICE_ROLE_KEY    service_role-nyckeln (kringgår RLS) — HEMLIG
-  BACKFILL                     "true" = hämta ~1 års historik, annars bara senaste
+Miljövariabler (kan ligga i .env bredvid scriptet):
+  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, BACKFILL (true=~1 års historik)
 """
 import os
-import sys
 import time
 import datetime as dt
 import requests
+
+
+def _load_dotenv(path):
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SERVICE_KEY  = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 SCHEMA       = "aktier"
 BACKFILL     = os.environ.get("BACKFILL", "false").lower() == "true"
 
-UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
 
-YF_CHART     = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-AVANZA_REF   = "https://www.avanza.se/_api/fund-reference/reference/{id}"
-AVANZA_CHART = "https://www.avanza.se/_api/fund-guide/chart/{id}/{period}"
+AV_STOCK      = "https://www.avanza.se/_api/market-guide/stock/{id}"
+AV_STOCK_CH   = "https://www.avanza.se/_api/price-chart/stock/{id}"
+AV_FUND       = "https://www.avanza.se/_api/fund-reference/reference/{id}"
+AV_FUND_CH    = "https://www.avanza.se/_api/fund-guide/chart/{id}/{period}"
+FRANKFURTER   = "https://api.frankfurter.app"
 
-# valuta -> Yahoo FX-symbol (kurs uttryckt i SEK per 1 enhet)
-FX_SYMBOL = {"USD": "SEK=X", "NOK": "NOKSEK=X", "EUR": "EURSEK=X"}
+STOCK_PERIOD  = "one_year"       # för historik-backfill (aktier)
+FUND_PERIOD   = "one_year"
+PAUSE         = 0.3
 
-STOCK_RANGE   = "1y" if BACKFILL else "5d"
-FUND_PERIOD   = "one_year"          # bevisat token; ger ~1 års historik
-REQUEST_PAUSE = 0.4                  # sekunder mellan externa anrop
+
+def utc_date(ms_or_s, is_ms=True):
+    ts = ms_or_s / 1000 if is_ms else ms_or_s
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).date().isoformat()
 
 
 # ----------------------------- Supabase ---------------------------------
@@ -59,7 +77,6 @@ def sb_get(table, params):
 def sb_upsert(table, rows, on_conflict):
     if not rows:
         return
-    # skicka i lagom stora batchar
     for i in range(0, len(rows), 500):
         chunk = rows[i:i + 500]
         r = requests.post(f"{SUPABASE_URL}/rest/v1/{table}",
@@ -71,63 +88,54 @@ def sb_upsert(table, rows, on_conflict):
             r.raise_for_status()
 
 
-# ----------------------------- Yahoo -------------------------------------
-def yahoo_fetch(sym, rng):
-    """Returnerar dict: price, prev_close, as_of (ISO), hist [(date, close)]."""
-    last_err = None
-    for attempt in range(2):
-        try:
-            r = requests.get(YF_CHART.format(sym=sym), headers=UA,
-                             params={"interval": "1d", "range": rng}, timeout=30)
-            r.raise_for_status()
-            res = r.json()["chart"]["result"][0]
-            break
-        except Exception as e:
-            last_err = e
-            time.sleep(1.0)
-    else:
-        raise last_err
+# ----------------------------- Avanza: aktier ----------------------------
+def avanza_stock_quote(oid):
+    r = requests.get(AV_STOCK.format(id=oid), headers=UA, timeout=30)
+    r.raise_for_status()
+    q = r.json().get("quote") or {}
+    last = q.get("last")
+    chg = q.get("changePercent")
+    prev = None
+    if last is not None and chg is not None:
+        prev = round(last / (1 + chg / 100.0), 4)
+    return last, prev
 
-    m  = res["meta"]
-    ts = res.get("timestamp") or []
-    closes = (res.get("indicators", {}).get("quote", [{}])[0].get("close")
-              if ts else None) or []
-    hist = []
-    for t, c in zip(ts, closes):
-        if c is None:
+
+def avanza_stock_hist(oid):
+    try:
+        r = requests.get(AV_STOCK_CH.format(id=oid), headers=UA,
+                         params={"timePeriod": STOCK_PERIOD}, timeout=30)
+        r.raise_for_status()
+        ohlc = r.json().get("ohlc") or []
+    except Exception as e:
+        print(f"  ! aktiehistorik {oid}: {e}")
+        return []
+    out = []
+    for p in ohlc:
+        c = p.get("close")
+        t = p.get("timestamp")
+        if c is None or t is None:
             continue
-        d = dt.datetime.utcfromtimestamp(t).date().isoformat()
-        hist.append((d, round(float(c), 4)))
-
-    as_of = None
-    if m.get("regularMarketTime"):
-        as_of = dt.datetime.utcfromtimestamp(m["regularMarketTime"]).isoformat() + "Z"
-
-    return {"price": m.get("regularMarketPrice"),
-            "prev_close": m.get("chartPreviousClose"),
-            "as_of": as_of,
-            "hist": hist}
+        out.append((utc_date(t), round(float(c), 4)))
+    return out
 
 
-# ----------------------------- Avanza ------------------------------------
+# ----------------------------- Avanza: fonder ----------------------------
 def avanza_nav(oid):
-    r = requests.get(AVANZA_REF.format(id=oid), headers=UA, timeout=30)
+    r = requests.get(AV_FUND.format(id=oid), headers=UA, timeout=30)
     r.raise_for_status()
     j = r.json()
-    nav = j.get("nav")
-    navdate = (j.get("navDate") or "")[:10]
-    return nav, navdate
+    return j.get("nav"), (j.get("navDate") or "")[:10]
 
 
-def avanza_hist(oid, nav_now):
-    """Avanza ger %-utveckling; ankra mot aktuell NAV -> absolut NAV per dag."""
+def avanza_fund_hist(oid, nav_now):
     try:
-        r = requests.get(AVANZA_CHART.format(id=oid, period=FUND_PERIOD),
+        r = requests.get(AV_FUND_CH.format(id=oid, period=FUND_PERIOD),
                          headers=UA, timeout=30)
         r.raise_for_status()
         serie = r.json().get("dataSerie") or []
     except Exception as e:
-        print(f"  ! avanza-historik {oid}: {e}")
+        print(f"  ! fondhistorik {oid}: {e}")
         return []
     if not serie or nav_now is None:
         return []
@@ -137,14 +145,27 @@ def avanza_hist(oid, nav_now):
     for p in serie:
         if p.get("y") is None:
             continue
-        d = dt.datetime.utcfromtimestamp(p["x"] / 1000).date().isoformat()
-        out.append((d, round(base * (1 + p["y"] / 100.0), 4)))
+        out.append((utc_date(p["x"]), round(base * (1 + p["y"] / 100.0), 4)))
     return out
+
+
+# ----------------------------- Frankfurter (FX) --------------------------
+def fx_latest(ccy):
+    r = requests.get(f"{FRANKFURTER}/latest", params={"from": ccy, "to": "SEK"}, timeout=30)
+    r.raise_for_status()
+    return r.json().get("rates", {}).get("SEK")
+
+
+def fx_hist(ccy, start):
+    r = requests.get(f"{FRANKFURTER}/{start}..", params={"from": ccy, "to": "SEK"}, timeout=30)
+    r.raise_for_status()
+    rates = r.json().get("rates", {})
+    return [(d, v.get("SEK")) for d, v in sorted(rates.items()) if v.get("SEK") is not None]
 
 
 # ----------------------------- Main --------------------------------------
 def main():
-    print(f"BACKFILL={BACKFILL}  stock_range={STOCK_RANGE}")
+    print(f"BACKFILL={BACKFILL}")
     instruments = sb_get("instruments", {
         "select": "id,name,type,currency,price_source,yahoo_ticker,avanza_orderbook_id"
     })
@@ -155,66 +176,69 @@ def main():
 
     for ins in instruments:
         currencies.add(ins["currency"])
+        oid = ins.get("avanza_orderbook_id")
         try:
-            if ins["price_source"] == "yahoo":
-                d = yahoo_fetch(ins["yahoo_ticker"], STOCK_RANGE)
-                if d["price"] is not None:
-                    quotes.append({"instrument_id": ins["id"], "price": d["price"],
-                                   "prev_close": d["prev_close"], "as_of": d["as_of"]})
-                for date, close in d["hist"]:
-                    prices.append({"instrument_id": ins["id"], "date": date, "close": close})
-                print(f"  {ins['name']}: {d['price']} ({len(d['hist'])} hist)")
+            if ins["type"] == "aktie":
+                if not oid:
+                    print(f"  ! {ins['name']}: saknar avanza_orderbook_id — hoppar")
+                    continue
+                last, prev = avanza_stock_quote(oid)
+                today = dt.date.today().isoformat()
+                if last is not None:
+                    quotes.append({"instrument_id": ins["id"], "price": last,
+                                   "prev_close": prev, "as_of": today + "T00:00:00Z"})
+                    prices.append({"instrument_id": ins["id"], "date": today, "close": last})
+                if BACKFILL:
+                    for d, c in avanza_stock_hist(oid):
+                        prices.append({"instrument_id": ins["id"], "date": d, "close": c})
+                print(f"  {ins['name']}: {last}")
 
-            elif ins["price_source"] == "avanza":
-                nav, navdate = avanza_nav(ins["avanza_orderbook_id"])
-                hist = avanza_hist(ins["avanza_orderbook_id"], nav) if BACKFILL else []
+            elif ins["type"] == "fond":
+                nav, navdate = avanza_nav(oid)
+                hist = avanza_fund_hist(oid, nav) if BACKFILL else []
                 prev = None
                 earlier = [c for (dd, c) in hist if dd < navdate]
                 if earlier:
                     prev = earlier[-1]
                 if nav is not None and navdate:
                     prices.append({"instrument_id": ins["id"], "date": navdate, "close": nav})
-                    for date, close in hist:
-                        prices.append({"instrument_id": ins["id"], "date": date, "close": close})
+                    for d, c in hist:
+                        prices.append({"instrument_id": ins["id"], "date": d, "close": c})
                     quotes.append({"instrument_id": ins["id"], "price": nav,
                                    "prev_close": prev, "as_of": navdate + "T00:00:00Z"})
-                    print(f"  {ins['name']}: NAV {nav} ({navdate}, {len(hist)} hist)")
-            time.sleep(REQUEST_PAUSE)
+                    print(f"  {ins['name']}: NAV {nav} ({navdate})")
+            time.sleep(PAUSE)
         except Exception as e:
             print(f"  ! {ins['name']} misslyckades: {e}")
 
-    # deduplicera priser på (instrument_id, date) — behåll sista
-    pd = {(p["instrument_id"], p["date"]): p for p in prices}
-    prices = list(pd.values())
-
+    dedup = {(p["instrument_id"], p["date"]): p for p in prices}
+    prices = list(dedup.values())
     sb_upsert("prices", prices, "instrument_id,date")
     sb_upsert("quotes", quotes, "instrument_id")
     print(f"Skrev {len(prices)} priser, {len(quotes)} quotes.")
 
-    # ---- FX (endast valutor som faktiskt används) ----
+    # ---- FX via Frankfurter ----
     fx = []
+    start = (dt.date.today() - dt.timedelta(days=370)).isoformat()
     for ccy in sorted(currencies):
         if ccy == "SEK":
             continue
-        sym = FX_SYMBOL.get(ccy)
-        if not sym:
-            print(f"  ! saknar FX-symbol för {ccy}")
-            continue
         try:
-            d = yahoo_fetch(sym, STOCK_RANGE)
             pair = f"{ccy}SEK"
-            for date, rate in d["hist"]:
-                fx.append({"pair": pair, "date": date, "rate": rate})
-            if d["price"] is not None:
+            if BACKFILL:
+                for d, rate in fx_hist(ccy, start):
+                    fx.append({"pair": pair, "date": d, "rate": round(float(rate), 6)})
+            latest = fx_latest(ccy)
+            if latest is not None:
                 fx.append({"pair": pair, "date": dt.date.today().isoformat(),
-                           "rate": round(float(d["price"]), 6)})
-            print(f"  FX {pair}: {d['price']}")
-            time.sleep(REQUEST_PAUSE)
+                           "rate": round(float(latest), 6)})
+            print(f"  FX {pair}: {latest}")
+            time.sleep(PAUSE)
         except Exception as e:
             print(f"  ! FX {ccy} misslyckades: {e}")
 
-    fxd = {(f["pair"], f["date"]): f for f in fx}
-    fx = list(fxd.values())
+    dedup = {(f["pair"], f["date"]): f for f in fx}
+    fx = list(dedup.values())
     sb_upsert("fx_rates", fx, "pair,date")
     print(f"Skrev {len(fx)} FX-rader. Klart.")
 
