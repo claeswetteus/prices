@@ -1,0 +1,37 @@
+name: aktier-priser
+
+on:
+  schedule:
+    # Var 15:e minut, vardagar, ca svensk handelstid (UTC; täcker både sommar/vinter)
+    - cron: "*/15 6-16 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "Hämta ~1 års historik"
+        type: boolean
+        default: false
+
+# Undvik överlappande körningar
+concurrency:
+  group: aktier-priser
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installera beroenden
+        run: pip install -r prices/requirements.txt
+
+      - name: Hämta kurser
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BACKFILL: ${{ github.event.inputs.backfill || 'false' }}
+        run: python prices/fetch_prices.py
