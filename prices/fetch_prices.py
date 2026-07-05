@@ -48,6 +48,7 @@ FRANKFURTER   = "https://api.frankfurter.app"
 STOCK_PERIOD  = "one_year"       # för historik-backfill (aktier)
 FUND_PERIOD   = "one_year"
 PAUSE         = 0.3
+NOW_ISO       = dt.datetime.now(dt.timezone.utc).isoformat()  # när kurserna hämtades
 
 
 def utc_date(ms_or_s, is_ms=True):
@@ -186,7 +187,7 @@ def main():
                 today = dt.date.today().isoformat()
                 if last is not None:
                     quotes.append({"instrument_id": ins["id"], "price": last,
-                                   "prev_close": prev, "as_of": today + "T00:00:00Z"})
+                                   "prev_close": prev, "as_of": NOW_ISO})
                     prices.append({"instrument_id": ins["id"], "date": today, "close": last})
                 if BACKFILL:
                     for d, c in avanza_stock_hist(oid):
@@ -205,7 +206,7 @@ def main():
                     for d, c in hist:
                         prices.append({"instrument_id": ins["id"], "date": d, "close": c})
                     quotes.append({"instrument_id": ins["id"], "price": nav,
-                                   "prev_close": prev, "as_of": navdate + "T00:00:00Z"})
+                                   "prev_close": prev, "as_of": NOW_ISO})
                     print(f"  {ins['name']}: NAV {nav} ({navdate})")
             time.sleep(PAUSE)
         except Exception as e:
