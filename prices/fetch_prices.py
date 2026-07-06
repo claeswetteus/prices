@@ -43,7 +43,11 @@ AV_STOCK      = "https://www.avanza.se/_api/market-guide/stock/{id}"
 AV_STOCK_CH   = "https://www.avanza.se/_api/price-chart/stock/{id}"
 AV_FUND       = "https://www.avanza.se/_api/fund-reference/reference/{id}"
 AV_FUND_CH    = "https://www.avanza.se/_api/fund-guide/chart/{id}/{period}"
+AV_INDEX      = "https://www.avanza.se/_api/market-index/{id}"
 FRANKFURTER   = "https://api.frankfurter.app"
+
+# Marknadsindex som visas i appens header (id = Avanza orderbookId)
+INDEXES = [("18988", "OMX Stockholm PI")]
 
 STOCK_PERIOD  = "one_year"       # för historik-backfill (aktier)
 FUND_PERIOD   = "one_year"
@@ -150,6 +154,15 @@ def avanza_fund_hist(oid, nav_now):
     return out
 
 
+# ----------------------------- Avanza: index -----------------------------
+def avanza_index(oid):
+    r = requests.get(AV_INDEX.format(id=oid), headers=UA, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    q = j.get("quote") or {}
+    return j.get("name"), q.get("last"), q.get("changePercent")
+
+
 # ----------------------------- Frankfurter (FX) --------------------------
 def fx_latest(ccy):
     r = requests.get(f"{FRANKFURTER}/latest", params={"from": ccy, "to": "SEK"}, timeout=30)
@@ -242,6 +255,21 @@ def main():
     fx = list(dedup.values())
     sb_upsert("fx_rates", fx, "pair,date")
     print(f"Skrev {len(fx)} FX-rader. Klart.")
+
+    # ---- Marknadsindex (OMXSPI m.fl.) ----
+    idx_rows = []
+    for oid, fallback in INDEXES:
+        try:
+            name, last, chg = avanza_index(oid)
+            if last is not None:
+                idx_rows.append({"id": oid, "name": name or fallback,
+                                 "price": last, "change_pct": chg, "as_of": NOW_ISO})
+                print(f"  Index {name or fallback}: {last} ({chg}%)")
+            time.sleep(PAUSE)
+        except Exception as e:
+            print(f"  ! index {oid} misslyckades: {e}")
+    sb_upsert("market_index", idx_rows, "id")
+    print(f"Skrev {len(idx_rows)} index.")
 
 
 if __name__ == "__main__":
