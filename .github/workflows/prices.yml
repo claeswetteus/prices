@@ -1,13 +1,8 @@
 name: aktier-priser
 
 on:
-  schedule:
-    # Vardagar var 5:e minut under börsens öppettider (SE 09:00–17:30).
-    # OBS: GitHub-cron är UTC och hanterar inte sommartid. Fönstret 07–16 UTC
-    # täcker svensk 09:00–17:30 både vinter (UTC+1) och sommar (UTC+2).
-    - cron: '*/5 7-16 * * 1-5'
-    # Helger: en gång per dag ~09:00 svensk tid (07:00 UTC).
-    - cron: '5 7 * * 6,0'
+  # Schemaläggning sker externt: cron-job.org anropar workflow_dispatch var 5:e
+  # minut under börstid (GitHubs inbyggda schedule var för opålitlig).
   workflow_dispatch:
     inputs:
       backfill:
