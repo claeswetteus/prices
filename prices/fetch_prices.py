@@ -46,8 +46,8 @@ AV_FUND_CH    = "https://www.avanza.se/_api/fund-guide/chart/{id}/{period}"
 AV_INDEX      = "https://www.avanza.se/_api/market-index/{id}"
 FRANKFURTER   = "https://api.frankfurter.app"
 
-# Marknadsindex som visas i appens header (id = Avanza orderbookId)
-INDEXES = [("18988", "OMX Stockholm PI")]
+# Marknadsindex som visas i appens header + används som proxy för fond-uppskattning
+INDEXES = [("18988", "OMX Stockholm PI"), ("155458", "Dow Jones U.S. Index")]
 
 STOCK_PERIOD  = "one_year"       # för historik-backfill (aktier)
 FUND_PERIOD   = "one_year"
