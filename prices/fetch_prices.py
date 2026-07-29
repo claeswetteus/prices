@@ -93,6 +93,29 @@ def sb_upsert(table, rows, on_conflict):
             r.raise_for_status()
 
 
+# ----------------------------- Teknisk analys --------------------------
+def sma(closes, n):
+    return sum(closes[-n:]) / n
+
+def wilder_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
 # ----------------------------- Avanza: aktier ----------------------------
 def avanza_stock_quote(oid):
     r = requests.get(AV_STOCK.format(id=oid), headers=UA, timeout=30)
@@ -270,6 +293,49 @@ def main():
             print(f"  ! index {oid} misslyckades: {e}")
     sb_upsert("market_index", idx_rows, "id")
     print(f"Skrev {len(idx_rows)} index.")
+
+    # ---- Teknisk analys (endast aktier, samma logik som gamla AktieBOT) ----
+    an_rows = []
+    for ins in instruments:
+        if ins["type"] != "aktie":
+            continue
+        try:
+            hist = sb_get("prices", {"instrument_id": f"eq.{ins['id']}",
+                                     "select": "date,close",
+                                     "order": "date.desc", "limit": "320"})
+            hist = sorted(hist, key=lambda p: p["date"])
+            closes = [float(p["close"]) for p in hist if p["close"] is not None]
+            if len(closes) < 200:
+                print(f"  Analys {ins['name']}: för lite data ({len(closes)})")
+                continue
+            s50, s200 = sma(closes, 50), sma(closes, 200)
+            s50_prev = sum(closes[-55:-5]) / 50          # SMA50 för ~en vecka sedan
+            rsi = wilder_rsi(closes, 14)
+            close = closes[-1]
+            golden = s50 > s200
+            above = close > s200
+            rsi_ok = rsi is not None and 40 < rsi < 75
+            rising = s50 > s50_prev
+            score = (3 if golden else 0) + (3 if above else 0) + (2 if rsi_ok else 0) + (2 if rising else 0)
+            rec = "KÖP" if score >= 8 else ("BEHÅLL" if score >= 5 else "SÄLJ")
+            entry = stop = target = None
+            if score >= 8:
+                entry = round(close, 2)
+                stop = round(close * 0.85, 2)      # -15% stop loss
+                target = round(close * 1.30, 2)    # +30% take profit
+            an_rows.append({
+                "instrument_id": ins["id"], "date": hist[-1]["date"], "score": score,
+                "recommendation": rec, "rsi": round(rsi, 2) if rsi is not None else None,
+                "sma50": round(s50, 4), "sma200": round(s200, 4), "close": round(close, 4),
+                "golden_cross": golden, "above_sma200": above, "rsi_ok": rsi_ok,
+                "sma50_rising": rising, "entry": entry, "stop_loss": stop, "take_profit": target,
+                "updated_at": NOW_ISO,
+            })
+            print(f"  Analys {ins['name']}: {score}/10 {rec}")
+        except Exception as e:
+            print(f"  ! analys {ins['name']} misslyckades: {e}")
+    sb_upsert("analysis", an_rows, "instrument_id")
+    print(f"Skrev {len(an_rows)} analysrader.")
 
 
 if __name__ == "__main__":
