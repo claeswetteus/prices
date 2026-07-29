@@ -294,10 +294,10 @@ def main():
     sb_upsert("market_index", idx_rows, "id")
     print(f"Skrev {len(idx_rows)} index.")
 
-    # ---- Teknisk analys (endast aktier, samma logik som gamla AktieBOT) ----
+    # ---- Teknisk analys (aktier + fonder, samma logik som gamla AktieBOT) ----
     an_rows = []
     for ins in instruments:
-        if ins["type"] != "aktie":
+        if ins["type"] not in ("aktie", "fond"):
             continue
         try:
             hist = sb_get("prices", {"instrument_id": f"eq.{ins['id']}",
