@@ -312,24 +312,25 @@ def main():
             s50_prev = sum(closes[-55:-5]) / 50          # SMA50 för ~en vecka sedan
             rsi = wilder_rsi(closes, 14)
             close = closes[-1]
+            high = max(closes)                            # ~1-års högsta (trailing)
             golden = s50 > s200
             above = close > s200
             rsi_ok = rsi is not None and 40 < rsi < 75
             rising = s50 > s50_prev
             score = (3 if golden else 0) + (3 if above else 0) + (2 if rsi_ok else 0) + (2 if rising else 0)
             rec = "KÖP" if score >= 8 else ("BEHÅLL" if score >= 5 else "SÄLJ")
-            entry = stop = target = None
+            stop = round(high * 0.85, 2)                  # trailing stop: -15% från högsta (gäller alla)
+            entry = target = None
             if score >= 8:
                 entry = round(close, 2)
-                stop = round(close * 0.85, 2)      # -15% stop loss
-                target = round(close * 1.30, 2)    # +30% take profit
+                target = round(close * 1.30, 2)           # +30% take profit
             an_rows.append({
                 "instrument_id": ins["id"], "date": hist[-1]["date"], "score": score,
                 "recommendation": rec, "rsi": round(rsi, 2) if rsi is not None else None,
                 "sma50": round(s50, 4), "sma200": round(s200, 4), "close": round(close, 4),
                 "golden_cross": golden, "above_sma200": above, "rsi_ok": rsi_ok,
                 "sma50_rising": rising, "entry": entry, "stop_loss": stop, "take_profit": target,
-                "updated_at": NOW_ISO,
+                "high": round(high, 4), "updated_at": NOW_ISO,
             })
             print(f"  Analys {ins['name']}: {score}/10 {rec}")
         except Exception as e:
