@@ -8,7 +8,10 @@ Valuta  -> Frankfurter (ECB-dagskurser, ingen nyckel)
 Skriver till Supabase-schemat 'aktier': prices, quotes, fx_rates.
 
 Miljövariabler (kan ligga i .env bredvid scriptet):
-  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, BACKFILL (true=~1 års historik)
+  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, BACKFILL (true=~1 års historik för alla)
+
+Instrument/valutapar med färre än MIN_HISTORY rader (t.ex. en nyinlagd aktie)
+får ~1 års historik automatiskt även när BACKFILL=false.
 """
 import os
 import time
@@ -52,6 +55,9 @@ INDEXES = [("18988", "OMX Stockholm PI"), ("155458", "Dow Jones U.S. Index")]
 STOCK_PERIOD  = "one_year"       # för historik-backfill (aktier)
 FUND_PERIOD   = "one_year"
 PAUSE         = 0.3
+# Har ett instrument/valutapar färre rader än så här hämtas ~1 års historik
+# automatiskt (t.ex. när en ny aktie läggs in). 200 = vad analysen (SMA200) kräver.
+MIN_HISTORY   = 200
 NOW_ISO       = dt.datetime.now(dt.timezone.utc).isoformat()  # när kurserna hämtades
 
 
@@ -77,6 +83,28 @@ def sb_get(table, params):
                      headers=sb_headers(), params=params, timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+def sb_count(table, params):
+    """Antal rader som matchar filtret (via PostgREST Content-Range)."""
+    h = sb_headers()
+    h["Prefer"] = "count=exact"
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}",
+                     headers=h, params={**params, "limit": "1"}, timeout=30)
+    r.raise_for_status()
+    total = (r.headers.get("Content-Range") or "*/0").split("/")[-1]
+    return int(total) if total.isdigit() else 0
+
+
+def needs_backfill(table, params):
+    """True om historiken är för kort (t.ex. nytillagd aktie/valuta)."""
+    if BACKFILL:
+        return True
+    try:
+        return sb_count(table, params) < MIN_HISTORY
+    except Exception as e:
+        print(f"  ! kunde inte räkna historik i {table}: {e}")
+        return False
 
 
 def sb_upsert(table, rows, on_conflict):
@@ -215,6 +243,11 @@ def main():
         currencies.add(ins["currency"])
         oid = ins.get("avanza_orderbook_id")
         try:
+            if ins["type"] in ("aktie", "fond"):
+                backfill = needs_backfill("prices", {"instrument_id": f"eq.{ins['id']}"})
+                if backfill and not BACKFILL:
+                    print(f"  {ins['name']}: för lite historik — hämtar ~1 år")
+
             if ins["type"] == "aktie":
                 if not oid:
                     print(f"  ! {ins['name']}: saknar avanza_orderbook_id — hoppar")
@@ -225,14 +258,14 @@ def main():
                     quotes.append({"instrument_id": ins["id"], "price": last,
                                    "prev_close": prev, "as_of": NOW_ISO})
                     prices.append({"instrument_id": ins["id"], "date": today, "close": last})
-                if BACKFILL:
+                if backfill:
                     for d, c in avanza_stock_hist(oid):
                         prices.append({"instrument_id": ins["id"], "date": d, "close": c})
                 print(f"  {ins['name']}: {last}")
 
             elif ins["type"] == "fond":
                 nav, navdate = avanza_nav(oid)
-                hist = avanza_fund_hist(oid, nav) if BACKFILL else []
+                hist = avanza_fund_hist(oid, nav) if backfill else []
                 prev = None
                 earlier = [c for (dd, c) in hist if dd < navdate]
                 if earlier:
@@ -262,7 +295,9 @@ def main():
             continue
         try:
             pair = f"{ccy}SEK"
-            if BACKFILL:
+            if needs_backfill("fx_rates", {"pair": f"eq.{pair}"}):
+                if not BACKFILL:
+                    print(f"  FX {pair}: för lite historik — hämtar ~1 år")
                 for d, rate in fx_hist(ccy, start):
                     fx.append({"pair": pair, "date": d, "rate": round(float(rate), 6)})
             latest = fx_latest(ccy)
